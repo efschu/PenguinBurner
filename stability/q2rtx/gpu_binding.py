@@ -72,9 +72,22 @@ def _apply_nvidia_render_offload_env(
     if vk_loader_select:
         updated["VK_LOADER_DEVICE_SELECT"] = vk_loader_select
     mesa_vk_select = str(selected_gpu.get("mesa_vk_device_select", "")).strip()
-    if mesa_vk_select:
+    # Mesa's device-select layer evaluates MESA_VK_DEVICE_SELECT before
+    # DRI_PRIME, and a vendor:device selector cannot tell two identical cards
+    # apart (the last enumerated match wins). On hosts with two cards of the
+    # same model that bound the benchmark to the wrong one. The DRI_PRIME PCI
+    # tag is exact, so it takes priority whenever it is available; the
+    # vendor:device selector is only a fallback without a PCI bus id.
+    if dri_prime:
+        updated.pop("MESA_VK_DEVICE_SELECT", None)
+        updated["MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE"] = "1"
+    elif mesa_vk_select:
         updated["MESA_VK_DEVICE_SELECT"] = f"{mesa_vk_select}!"
         updated["MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE"] = "1"
+    if dri_prime or mesa_vk_select:
+        # Makes the layer print the selectable devices with their PCI
+        # addresses into the stability log, so the bound card is provable.
+        updated["MESA_VK_DEVICE_SELECT_DEBUG"] = "1"
     # The NVIDIA ICD ignores the selectors above on multi-GPU boxes, so the
     # Vulkan loader still enumerates all cards and the benchmark's "first
     # capable device" pick is arbitrary. Pass the target UUID so a patched
@@ -114,6 +127,7 @@ def _selected_gpu_log_lines(
         "VK_LOADER_DEVICE_SELECT",
         "MESA_VK_DEVICE_SELECT",
         "MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE",
+        "MESA_VK_DEVICE_SELECT_DEBUG",
     ]
     values = [
         f"{key}={child_env[key]}" for key in keys if str(child_env.get(key, "")).strip()

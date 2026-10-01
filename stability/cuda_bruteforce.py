@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import os
 import time
 
 PTX_SOURCE = rb"""
@@ -140,6 +141,124 @@ class CudaDriverError(RuntimeError):
     pass
 
 
+class _NvmlPciInfo(ctypes.Structure):
+    _fields_ = [
+        ("busIdLegacy", ctypes.c_char * 16),
+        ("domain", ctypes.c_uint),
+        ("bus", ctypes.c_uint),
+        ("device", ctypes.c_uint),
+        ("pciDeviceId", ctypes.c_uint),
+        ("pciSubSystemId", ctypes.c_uint),
+        ("busId", ctypes.c_char * 32),
+    ]
+
+
+def _normalize_pci_bus_id(bus_id: str) -> str:
+    """Return ``dddd:bb:dd.f`` (lowercase, 16-bit domain) or "" if malformed."""
+    cleaned = str(bus_id or "").strip().lower()
+    try:
+        domain_text, bus_text, rest = cleaned.split(":", 2)
+        device_text, function_text = rest.split(".", 1)
+        domain = int(domain_text, 16) & 0xFFFF
+        bus = int(bus_text, 16)
+        device = int(device_text, 16)
+        function = int(function_text, 16)
+    except ValueError:
+        return ""
+    return f"{domain:04x}:{bus:02x}:{device:02x}.{function:x}"
+
+
+def _nvml_pci_bus_id(gpu_index: int) -> str:
+    """PCI bus id of NVML device ``gpu_index``, or "" when NVML is unusable.
+
+    ``--gpu-index`` is an NVML index everywhere else in PenguinBurner (the
+    daemon opens ``nvml.device_by_index``), and NVML enumerates in PCI bus
+    order. CUDA's default ordinal order is FASTEST_FIRST, so on hosts with
+    mixed GPU models ``cuDeviceGet(gpu_index)`` loads a different card than
+    the one being tuned. Resolving through the PCI bus id keeps both aligned.
+    """
+    try:
+        nvml = ctypes.CDLL(
+            ctypes.util.find_library("nvidia-ml") or "libnvidia-ml.so.1"
+        )
+    except OSError:
+        return ""
+    nvml.nvmlInit_v2.restype = ctypes.c_int
+    nvml.nvmlShutdown.restype = ctypes.c_int
+    nvml.nvmlDeviceGetHandleByIndex_v2.argtypes = [
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    nvml.nvmlDeviceGetHandleByIndex_v2.restype = ctypes.c_int
+    nvml.nvmlDeviceGetPciInfo_v3.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_NvmlPciInfo),
+    ]
+    nvml.nvmlDeviceGetPciInfo_v3.restype = ctypes.c_int
+    if nvml.nvmlInit_v2() != 0:
+        return ""
+    try:
+        handle = ctypes.c_void_p()
+        if nvml.nvmlDeviceGetHandleByIndex_v2(
+            ctypes.c_uint(int(gpu_index)), ctypes.byref(handle)
+        ) != 0:
+            return ""
+        info = _NvmlPciInfo()
+        if nvml.nvmlDeviceGetPciInfo_v3(handle, ctypes.byref(info)) != 0:
+            return ""
+        return f"{info.domain & 0xFFFF:04x}:{info.bus:02x}:{info.device:02x}.0"
+    finally:
+        nvml.nvmlShutdown()
+
+
+def _cuda_device_pci_bus_id(driver: "_CudaDriver", device: int) -> str:
+    buffer = ctypes.create_string_buffer(32)
+    driver.check(
+        driver.lib.cuDeviceGetPCIBusId(buffer, len(buffer), int(device)),
+        "cuDeviceGetPCIBusId",
+    )
+    return _normalize_pci_bus_id(buffer.value.decode("ascii", "replace"))
+
+
+def _resolve_cuda_device(driver: "_CudaDriver", gpu_index: int) -> ctypes.c_int:
+    """Open the CUDA device that is NVML device ``gpu_index``.
+
+    Fails loudly instead of loading another card: a companion load on the
+    wrong GPU makes every stability verdict meaningless.
+    """
+    device = ctypes.c_int()
+    target_bus_id = _nvml_pci_bus_id(int(gpu_index))
+    if target_bus_id:
+        driver.check(
+            driver.lib.cuDeviceGetByPCIBusId(
+                ctypes.byref(device), target_bus_id.encode("ascii")
+            ),
+            f"cuDeviceGetByPCIBusId({target_bus_id})",
+        )
+    else:
+        if os.environ.get("CUDA_DEVICE_ORDER", "") != "PCI_BUS_ID":
+            raise CudaDriverError(
+                "cannot resolve NVML GPU index "
+                f"{int(gpu_index)} to a PCI bus id and CUDA_DEVICE_ORDER is not "
+                "PCI_BUS_ID; refusing to guess the CUDA device"
+            )
+        driver.check(
+            driver.lib.cuDeviceGet(ctypes.byref(device), int(gpu_index)),
+            "cuDeviceGet",
+        )
+    actual_bus_id = _cuda_device_pci_bus_id(driver, int(device.value))
+    if target_bus_id and actual_bus_id != target_bus_id:
+        raise CudaDriverError(
+            f"CUDA device {int(device.value)} is at PCI {actual_bus_id}, "
+            f"expected {target_bus_id} for NVML GPU index {int(gpu_index)}"
+        )
+    _log(
+        f"bound nvml-gpu-index={int(gpu_index)} cuda-ordinal={int(device.value)} "
+        f"pci-bus-id={actual_bus_id}"
+    )
+    return device
+
+
 class _CudaDriver:
     def __init__(self) -> None:
         library_name = ctypes.util.find_library("cuda") or "libcuda.so.1"
@@ -151,6 +270,17 @@ class _CudaDriver:
         self.lib.cuInit.restype = ctypes.c_int
         self.lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
         self.lib.cuDeviceGet.restype = ctypes.c_int
+        self.lib.cuDeviceGetByPCIBusId.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_char_p,
+        ]
+        self.lib.cuDeviceGetByPCIBusId.restype = ctypes.c_int
+        self.lib.cuDeviceGetPCIBusId.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self.lib.cuDeviceGetPCIBusId.restype = ctypes.c_int
         self.lib.cuCtxCreate_v2.argtypes = [
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.c_uint,
@@ -349,10 +479,7 @@ def run_cuda_bruteforce_test(*, gpu_index: int, duration_seconds: float) -> None
     last_stress_seed1 = seed1
 
     driver.check(driver.lib.cuInit(0), "cuInit")
-    device = ctypes.c_int()
-    driver.check(
-        driver.lib.cuDeviceGet(ctypes.byref(device), int(gpu_index)), "cuDeviceGet"
-    )
+    device = _resolve_cuda_device(driver, int(gpu_index))
     driver.check(
         driver.lib.cuCtxCreate_v2(ctypes.byref(context), 0, int(device.value)),
         "cuCtxCreate_v2",

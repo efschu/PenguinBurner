@@ -57,9 +57,17 @@ def dispatch_cli(
             # profile misbehaves or the desktop session is unusable.
             from profiles.uv.profile_store import STOCK_PROFILE_SELECTOR
 
+            stock_intent: dict = {"profile_selector": STOCK_PROFILE_SELECTOR}
+            # Honour an explicit --gpu-index so multi-GPU hosts can restore
+            # one specific card; without it the configured GPU is used.
+            restore_gpu_index = runtime_intent_from_argv(runtime_argv).get(
+                "gpu_index"
+            )
+            if restore_gpu_index is not None:
+                stock_intent["gpu_index"] = int(restore_gpu_index)
             try:
                 _apply_runtime_intent_through_daemon(
-                    {"profile_selector": STOCK_PROFILE_SELECTOR},
+                    stock_intent,
                     persist_on_startup=True,
                 )
             except Exception as exc:  # noqa: BLE001

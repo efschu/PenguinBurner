@@ -140,6 +140,27 @@ def test_dispatch_cli_restore_stock_persists_stock_for_boot(monkeypatch) -> None
     ]
 
 
+def test_dispatch_cli_restore_stock_honours_gpu_index(monkeypatch) -> None:
+    applied = []
+    monkeypatch.setattr(
+        entry,
+        "apply_runtime_intent",
+        lambda intent, **kwargs: applied.append((intent, kwargs))
+        or {"started": True, "runtime_mode": "stock"},
+    )
+
+    exit_code = entry.dispatch_cli(
+        program_file="/tmp/penguin_burner.py",
+        main_callback=lambda *_args, **_kwargs: None,
+        argv=["--restore-stock", "--gpu-index", "2"],
+    )
+
+    assert exit_code == 0
+    assert [intent for intent, _kwargs in applied] == [
+        {"profile_selector": "__stock__", "gpu_index": 2}
+    ]
+
+
 def test_dispatch_cli_daemonize_applies_through_running_daemon(monkeypatch) -> None:
     applied = []
     monkeypatch.setattr(

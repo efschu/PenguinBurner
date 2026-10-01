@@ -511,6 +511,33 @@ def test_q2rtx_runtime_env_binds_selected_gpu_from_runtime_identity() -> None:
 
     assert env["DRI_PRIME"] == "pci-0000_03_00_0!"
     assert env["VK_LOADER_DEVICE_SELECT"] == "0x10de:0x2c02"
+    # The exact PCI tag wins: Mesa evaluates MESA_VK_DEVICE_SELECT first and a
+    # vendor:device selector cannot distinguish two identical cards.
+    assert "MESA_VK_DEVICE_SELECT" not in env
+    assert env["MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE"] == "1"
+    assert env["MESA_VK_DEVICE_SELECT_DEBUG"] == "1"
+
+
+def test_q2rtx_runtime_env_drops_inherited_vendor_selector_when_pci_known() -> None:
+    env = q2rtx_runtime._apply_nvidia_render_offload_env(
+        {"MESA_VK_DEVICE_SELECT": "10de:2206!"},
+        selected_gpu={
+            "dri_prime": "pci-0000_0e_00_0",
+            "mesa_vk_device_select": "10de:2206",
+        },
+    )
+
+    assert env["DRI_PRIME"] == "pci-0000_0e_00_0!"
+    assert "MESA_VK_DEVICE_SELECT" not in env
+
+
+def test_q2rtx_runtime_env_falls_back_to_vendor_selector_without_pci() -> None:
+    env = q2rtx_runtime._apply_nvidia_render_offload_env(
+        {},
+        selected_gpu={"mesa_vk_device_select": "10de:2c02"},
+    )
+
+    assert "DRI_PRIME" not in env
     assert env["MESA_VK_DEVICE_SELECT"] == "10de:2c02!"
     assert env["MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE"] == "1"
 
